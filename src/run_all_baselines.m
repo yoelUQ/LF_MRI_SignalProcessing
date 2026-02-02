@@ -1,0 +1,462 @@
+function R = run_all_baselines(matfile)
+% RUN_ALL_BASELINES
+% - Uses ONE shared split (80/10/10) for Linear, Dense, CNN1D (saved once per dataset).
+% - Uses ONE shared set of 6 example samples (absolute dataset indices) from the TEST set.
+% - Dense/CNN: model caching. If model exists, it is loaded and NOT retrained.
+% - Saves 3 figures per method (samples / per-sample MSE / freq IQR) with short titles.
+%
+% Outputs:
+%   R.linear.mse, R.dense.mse, R.cnn1d.mse
+%
+% Saved folders (next to matfile):
+%   accuracy_shared/             (split + example indices)
+%   models_dense/                (<matname>_dense_net.mat)
+%   models_cnn1d/                (<matname>_cnn1d_net.mat)
+%   accuracy_plots_linear/       (3 PNGs)
+%   accuracy_plots_dense/        (3 PNGs)
+%   accuracy_plots_cnn1d/        (3 PNGs)
+
+    % ----------------------------
+    % Load
+    % ----------------------------
+    try
+        whos('-file', matfile);
+        S = load(matfile);
+    catch ME
+        error('CORRUPTED_MAT_FILE: %s', ME.message);
+    end
+
+    X = S.src_data;          % [N x 51 x 15]
+    Y = S.tgt_data;          % [N x 51]
+    xfreq = [];
+    if isfield(S,'xfreq'), xfreq = S.xfreq(:); end
+
+    [N,T,F] = size(X);
+    assert(T==51 && F==15, 'Expected src_data: [N x 51 x 15]');
+    assert(all(size(Y)==[N T]), 'Expected tgt_data: [N x 51]');
+
+    [matdir, matname, ~] = fileparts(matfile);
+    label = makeShortLabel(matname);
+
+    % ----------------------------
+    % Shared caches
+    % ----------------------------
+    sharedDir = fullfile(matdir, 'accuracy_shared');
+    if ~exist(sharedDir,'dir'); mkdir(sharedDir); end
+
+    % ONE shared split for all methods (80/10/10)
+    split = get_or_make_split(sharedDir, matname, N);
+
+    % ONE shared set of 6 absolute example indices from TEST (split-aware)
+    ex = get_or_make_examples(sharedDir, matname, split.idxTest, 6);
+
+    % ----------------------------
+    % Run methods
+    % ----------------------------
+    R = struct();
+    R.matfile = matfile;
+    R.label = label;
+    R.split = split;
+    R.examples_abs_idx = ex.idx_abs;
+
+    R.linear = run_linear(X, Y, xfreq, split, ex, matdir, matname, label);
+    R.dense  = run_dense(X, Y, xfreq, split, ex, matdir, matname, label);
+    R.cnn1d  = run_cnn1d(X, Y, xfreq, split, ex, matdir, matname, label);
+
+end
+
+% =====================================================================
+% LINEAR (per-frequency OLS)
+% =====================================================================
+function out = run_linear(X, Y, xfreq, split, ex, matdir, matname, label)
+
+    tr = split.idxTrain;
+    te = split.idxTest;
+
+    Fbins = size(X,2);
+    Yhat = zeros(numel(te), Fbins);
+
+    for f = 1:Fbins
+        Xtr = squeeze(X(tr,f,:));    % [nTrain x 15]
+        ytr = Y(tr,f);               % [nTrain x 1]
+        beta = Xtr \ ytr;
+
+        Xte = squeeze(X(te,f,:));    % [nTest x 15]
+        Yhat(:,f) = Xte * beta;
+    end
+
+    Yte = Y(te,:);
+    mse = mean((Yhat(:) - Yte(:)).^2);
+
+    out.mse = mse;
+    out.xfreq = xfreq;
+    out.y_mean_test = mean(Yte,1);
+    out.yhat_mean_test = mean(Yhat,1);
+
+    outDir = fullfile(matdir, 'accuracy_plots_linear');
+    if ~exist(outDir,'dir'); mkdir(outDir); end
+    save_three_plots(outDir, matname, label, 'Linear', xfreq, Yte, Yhat, te, ex.idx_abs, mse);
+
+end
+
+% =====================================================================
+% DENSE (sequence MLP – your earlier "state-of-the-art" used in project)
+% Cached: models_dense/<matname>_dense_net.mat
+% =====================================================================
+function out = run_dense(X, Y, xfreq, split, ex, matdir, matname, label)
+
+    tr = split.idxTrain;
+    va = split.idxVal;
+    te = split.idxTest;
+
+    XTrain = make_seq_cell(X, tr);
+    YTrain = make_y_cell(Y, tr);
+    XVal   = make_seq_cell(X, va);
+    YVal   = make_y_cell(Y, va);
+    XTest  = make_seq_cell(X, te);
+    YTest  = make_y_cell(Y, te);
+
+    numFeatures = 15;
+    layers_dense = [
+        sequenceInputLayer(numFeatures, 'Normalization','zscore', 'Name','input')
+        fullyConnectedLayer(1000,'Name','fc1')
+        reluLayer('Name','relu1')
+        fullyConnectedLayer(500,'Name','fc2')
+        reluLayer('Name','relu2')
+        fullyConnectedLayer(100,'Name','fc3')
+        reluLayer('Name','relu3')
+        fullyConnectedLayer(1,'Name','fc_out')
+        regressionLayer('Name','reg')
+    ];
+
+    opts = trainingOptions('adam', ...
+        'MaxEpochs', 30, ...
+        'MiniBatchSize', 16, ...
+        'InitialLearnRate', 1e-3, ...
+        'Shuffle','every-epoch', ...
+        'ValidationData', {XVal, YVal}, ...
+        'ValidationFrequency', 50, ...
+        'Verbose', false);
+
+    % ---- model cache ----
+    modelDir  = fullfile(matdir, 'models_dense');
+    if ~exist(modelDir,'dir'); mkdir(modelDir); end
+    modelPath = fullfile(modelDir, sprintf('%s_dense_net.mat', matname));
+
+    if exist(modelPath,'file')
+        tmp = load(modelPath,'net'); net = tmp.net;
+    else
+        net = trainNetwork(XTrain, YTrain, layers_dense, opts);
+        try
+            save(modelPath,'net','-v7.3');
+        catch
+            save(modelPath,'net');
+        end
+    end
+
+    YhatCell = predict(net, XTest, 'MiniBatchSize', 128);
+    [Yhat, Yte] = stack_cells(YhatCell, YTest);
+
+    mse = mean((Yhat(:) - Yte(:)).^2);
+
+    out.mse = mse;
+    out.xfreq = xfreq;
+    out.y_mean_test = mean(Yte,1);
+    out.yhat_mean_test = mean(Yhat,1);
+
+    outDir = fullfile(matdir, 'accuracy_plots_dense');
+    if ~exist(outDir,'dir'); mkdir(outDir); end
+    save_three_plots(outDir, matname, label, 'Dense', xfreq, Yte, Yhat, te, ex.idx_abs, mse);
+
+end
+
+% =====================================================================
+% CNN1D (paper-style Conv1D stack – your earlier "state-of-the-art")
+% Cached: models_cnn1d/<matname>_cnn1d_net.mat
+% =====================================================================
+function out = run_cnn1d(X, Y, xfreq, split, ex, matdir, matname, label)
+
+    tr = split.idxTrain;
+    va = split.idxVal;
+    te = split.idxTest;
+
+    XTrain = make_seq_cell(X, tr);
+    YTrain = make_y_cell(Y, tr);
+    XVal   = make_seq_cell(X, va);
+    YVal   = make_y_cell(Y, va);
+    XTest  = make_seq_cell(X, te);
+    YTest  = make_y_cell(Y, te);
+
+    numFeatures = 15;
+    numFiltersCNN = 16;
+    kernelSizeCNN = 64;
+    numLayersCNN  = 7;
+
+    layers_cnn = buildNoiseCNN(numFeatures, numFiltersCNN, kernelSizeCNN, numLayersCNN);
+
+    opts = trainingOptions('adam', ...
+        'MaxEpochs', 30, ...
+        'MiniBatchSize', 16, ...
+        'InitialLearnRate', 1e-3, ...
+        'Shuffle','every-epoch', ...
+        'ValidationData', {XVal, YVal}, ...
+        'ValidationFrequency', 50, ...
+        'Verbose', true);
+
+    % ---- model cache ----
+    modelDir  = fullfile(matdir, 'models_cnn1d');
+    if ~exist(modelDir,'dir'); mkdir(modelDir); end
+    modelPath = fullfile(modelDir, sprintf('%s_cnn1d_net.mat', matname));
+
+    if exist(modelPath,'file')
+        tmp = load(modelPath,'net'); net = tmp.net;
+    else
+        net = trainNetwork(XTrain, YTrain, layers_cnn, opts);
+        try
+            save(modelPath,'net','-v7.3');
+        catch
+            save(modelPath,'net');
+        end
+    end
+
+    YhatCell = predict(net, XTest, 'MiniBatchSize', 128);
+    [Yhat, Yte] = stack_cells(YhatCell, YTest);
+
+    mse = mean((Yhat(:) - Yte(:)).^2);
+
+    out.mse = mse;
+    out.xfreq = xfreq;
+    out.y_mean_test = mean(Yte,1);
+    out.yhat_mean_test = mean(Yhat,1);
+
+    outDir = fullfile(matdir, 'accuracy_plots_cnn1d');
+    if ~exist(outDir,'dir'); mkdir(outDir); end
+    save_three_plots(outDir, matname, label, 'CNN1D', xfreq, Yte, Yhat, te, ex.idx_abs, mse);
+
+end
+
+% =====================================================================
+% PLOTTING (3 figures) — ALWAYS 6 SAME ABSOLUTE SAMPLES across methods
+% Inputs:
+%   Yte, Yhat are already test-set matrices [nTest x 51]
+%   testAbsIdx are absolute indices of test samples (1..N)
+%   exAbsIdx are absolute indices of chosen example samples (subset of testAbsIdx)
+% =====================================================================
+function save_three_plots(outDir, matname, label, methodName, xfreq, Yte, Yhat, testAbsIdx, exAbsIdx, mse)
+
+    % Axis
+    if ~isempty(xfreq) && numel(xfreq)==size(Yte,2)
+        xax = xfreq(:).';
+        xlab = 'Frequency (Hz)';
+    else
+        xax = 1:size(Yte,2);
+        xlab = 'Frequency bin';
+    end
+
+    % Map absolute example IDs -> positions within test set
+    testAbsIdx = testAbsIdx(:);
+    exAbsIdx   = exAbsIdx(:);
+
+    [isIn, loc] = ismember(exAbsIdx, testAbsIdx);
+    loc = loc(isIn);
+
+    % Ensure exactly 6 plotted if possible
+    K = 6;
+    Kshow = min(K, size(Yte,1));
+    if numel(loc) < Kshow
+        rng(999); % deterministic top-up
+        pool = setdiff(1:size(Yte,1), loc);
+        add = pool(randperm(numel(pool), min(Kshow-numel(loc), numel(pool))));
+        loc = [loc; add(:)];
+    end
+    loc = loc(1:Kshow);
+
+    % ---------- FIG 1: 6 sample overlays ----------
+    fig1 = figure('Color','w');
+    try
+        tl = tiledlayout(3,2,'TileSpacing','compact','Padding','compact');
+        hT = []; hP = [];
+        for k = 1:Kshow
+            ii = loc(k);
+            ax = nexttile; hold(ax,'on');
+            p1 = plot(ax, xax, Yte(ii,:), 'k', 'LineWidth', 1.2);
+            p2 = plot(ax, xax, Yhat(ii,:), 'r--', 'LineWidth', 1.2);
+            if k==1, hT=p1; hP=p2; end
+            grid(ax,'on');
+            title(ax, sprintf('Sample %d', testAbsIdx(ii)), 'Interpreter','none');
+            xlabel(ax, xlab); ylabel(ax, 'Noise amplitude');
+        end
+
+        if ~isempty(hT) && ~isempty(hP)
+            legend([hT hP], {'Target','Predicted'}, 'Location','southoutside', 'Orientation','horizontal');
+        end
+        sgtitle(tl, sprintf('%s | %s | Test MSE=%.4g', label, methodName, mse), 'Interpreter','none');
+    catch
+        clf(fig1);
+        ii = loc(1);
+        plot(xax, Yte(ii,:), 'k', 'LineWidth', 1.2); hold on;
+        plot(xax, Yhat(ii,:), 'r--', 'LineWidth', 1.2);
+        grid on; xlabel(xlab); ylabel('Noise amplitude');
+        legend('Target','Predicted','Location','best');
+        title(sprintf('%s | %s | Test MSE=%.4g', label, methodName, mse), 'Interpreter','none');
+    end
+    exportgraphics(fig1, fullfile(outDir, sprintf('%s_%s_samples.png', matname, lower(methodName))), 'Resolution', 200);
+    close(fig1);
+
+    % ---------- FIG 2: per-sample MSE histogram ----------
+    mse_per = mean((Yhat - Yte).^2, 2);
+    fig2 = figure('Color','w');
+    histogram(mse_per, 60); grid on;
+    xlabel('Per-sample MSE'); ylabel('Count');
+    title(sprintf('%s | %s | Per-sample MSE (median=%.3g, 90%%=%.3g)', ...
+        label, methodName, median(mse_per), prctile(mse_per,90)), 'Interpreter','none');
+    exportgraphics(fig2, fullfile(outDir, sprintf('%s_%s_mse_hist.png', matname, lower(methodName))), 'Resolution', 200);
+    close(fig2);
+
+    % ---------- FIG 3: frequency-wise error (mean + IQR) ----------
+    E2 = (Yhat - Yte).^2;
+    mse_f = mean(E2,1);
+    q25 = prctile(E2,25,1);
+    q75 = prctile(E2,75,1);
+
+    fig3 = figure('Color','w'); hold on; grid on;
+    plot(xax, mse_f, 'LineWidth', 1.8);
+    plot(xax, q25, '--', 'LineWidth', 1.0);
+    plot(xax, q75, '--', 'LineWidth', 1.0);
+    xlabel(xlab); ylabel('Squared error');
+    legend('Mean SE','25th pct','75th pct','Location','best');
+    title(sprintf('%s | %s | Frequency-wise error (mean + IQR)', label, methodName), 'Interpreter','none');
+    exportgraphics(fig3, fullfile(outDir, sprintf('%s_%s_freq_iqr.png', matname, lower(methodName))), 'Resolution', 200);
+    close(fig3);
+
+end
+
+% =====================================================================
+% Shared split: saved once and reused
+% =====================================================================
+function split = get_or_make_split(sharedDir, matname, N)
+    splitPath = fullfile(sharedDir, sprintf('%s_split_80_10_10_seed1.mat', matname));
+
+    if exist(splitPath,'file')
+        tmp = load(splitPath, 'idxTrain','idxVal','idxTest');
+        split.idxTrain = tmp.idxTrain;
+        split.idxVal   = tmp.idxVal;
+        split.idxTest  = tmp.idxTest;
+        return;
+    end
+
+    rng(1);
+    idx = randperm(N);
+    nTrain = round(0.8*N);
+    nVal   = round(0.1*N);
+
+    split.idxTrain = idx(1:nTrain);
+    split.idxVal   = idx(nTrain+1:nTrain+nVal);
+    split.idxTest  = idx(nTrain+nVal+1:end);
+
+    save(splitPath, '-struct', 'split');
+end
+
+% =====================================================================
+% Shared examples: always 6 abs indices from TEST, split-aware cache
+% =====================================================================
+function ex = get_or_make_examples(sharedDir, matname, idxTestAbs, K)
+    idxTestAbs = idxTestAbs(:);
+
+    exPath = fullfile(sharedDir, sprintf('%s_examples_from_TEST_K%d_seed123.mat', matname, K));
+
+    % signature so we never reuse examples from a different split
+    sig = [numel(idxTestAbs), sum(double(idxTestAbs)), sum(double(idxTestAbs).^2)];
+
+    if exist(exPath,'file')
+        tmp = load(exPath);
+        if isfield(tmp,'idx_abs') && isfield(tmp,'sig') && isequal(tmp.sig, sig) ...
+                && numel(tmp.idx_abs) >= min(K, numel(idxTestAbs))
+            ex.idx_abs = tmp.idx_abs(:);
+            ex.sig = tmp.sig;
+            return;
+        else
+            delete(exPath); % stale/short -> regenerate
+        end
+    end
+
+    rng(123);
+    Kuse = min(K, numel(idxTestAbs));
+    pick = randperm(numel(idxTestAbs), Kuse);
+    ex.idx_abs = idxTestAbs(pick);
+    ex.sig = sig;
+
+    save(exPath, '-struct', 'ex');
+end
+
+% =====================================================================
+% Sequence helpers
+% =====================================================================
+function XCell = make_seq_cell(X, idxAbs)
+    n = numel(idxAbs);
+    XCell = cell(n,1);
+    for k = 1:n
+        i = idxAbs(k);
+        xi = squeeze(X(i,:,:));   % 51 x 15
+        XCell{k} = xi.';          % 15 x 51
+    end
+end
+
+function YCell = make_y_cell(Y, idxAbs)
+    n = numel(idxAbs);
+    YCell = cell(n,1);
+    for k = 1:n
+        i = idxAbs(k);
+        YCell{k} = Y(i,:);        % 1 x 51
+    end
+end
+
+function [Yhat, Yte] = stack_cells(YhatCell, YtrueCell)
+    n = numel(YtrueCell);
+    Yhat = zeros(n, 51);
+    Yte  = zeros(n, 51);
+    for i = 1:n
+        Yhat(i,:) = reshape(YhatCell{i}, 1, []);
+        Yte(i,:)  = reshape(YtrueCell{i}, 1, []);
+    end
+end
+
+% =====================================================================
+% CNN builder (paper-style)
+% =====================================================================
+function layers = buildNoiseCNN(numFeatures, numFilters, kernelSize, numLayers)
+    layers = [
+        sequenceInputLayer(numFeatures, "Name","input", "Normalization","zscore")
+    ];
+
+    for L = 1:numLayers
+        layers = [
+            layers
+            convolution1dLayer(kernelSize, numFilters, "Padding","same", "Name", sprintf("conv_%d",L))
+            reluLayer("Name", sprintf("relu_%d",L))
+        ];
+    end
+
+    layers = [
+        layers
+        convolution1dLayer(1, 1, "Padding","same", "Name","conv_final")
+        regressionLayer("Name","regression_output")
+    ];
+end
+
+% =====================================================================
+% Short label helper (no underscores in titles)
+% =====================================================================
+function s = makeShortLabel(matname)
+    m = upper(matname);
+    if contains(m,'_ABS_'), spec = 'ABS';
+    elseif contains(m,'_REAL_'), spec = 'REAL';
+    elseif contains(m,'_IMG_') || contains(m,'_IMAG_'), spec = 'IMAG';
+    else, spec = 'DATA';
+    end
+    tok = regexp(matname, '_(\d{2,3})kHz', 'tokens', 'once');
+    if isempty(tok), fk = '';
+    else, fk = [tok{1} 'kHz'];
+    end
+    if isempty(fk), s = spec; else, s = [spec ' ' fk]; end
+end
