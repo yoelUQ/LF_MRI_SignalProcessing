@@ -1,8 +1,8 @@
 function results = run_cnn1d_paperstyle(matfile)
-% CNN (DAY 9 paper-style): repeated Conv1D blocks + final 1x1 conv
+% CNN: repeated Conv1D blocks + final 1x1 conv
 % Input X: [N x 51 x 15], Target Y: [N x 51]
 
-    rng(1);  % match DAY 9 split behavior
+    rng(1);  % 
 
     % ---- robust load ----
     try
@@ -20,7 +20,7 @@ function results = run_cnn1d_paperstyle(matfile)
     assert(T==51 && F==15, 'Expected X: [N x 51 x 15]');
     assert(all(size(Y)==[N T]), 'Expected Y: [N x 51]');
 
-    % ---- split: 80/10/10 (DAY 9) ----
+    % ---- split: 80/10/10 ( ) ----
     idx = randperm(N);
     nTrain = round(0.8*N);
     nVal   = round(0.1*N);
@@ -56,7 +56,7 @@ function results = run_cnn1d_paperstyle(matfile)
         YTest{k} = Y(i,:);         % 1 x 51
     end
 
-    % ---- DAY 9 paper CNN parameters (defaults) ----
+    % ----   paper CNN parameters (defaults) ----
     numFeatures = 15;
     numFiltersCNN = 16;
     kernelSizeCNN = 64;
@@ -211,7 +211,7 @@ function results = run_cnn1d_paperstyle(matfile)
 
 end
 
-% ---- DAY 9 paper-style CNN builder ----
+% ----   paper-style CNN builder ----
 function layers = buildNoiseCNN(numFeatures, numFilters, kernelSize, numLayers)
     layers = [
         sequenceInputLayer(numFeatures, "Name","input", "Normalization","zscore")
@@ -247,3 +247,4 @@ function s = makeShortLabel(matname)
     end
     if isempty(fk), s = spec; else, s = [spec ' ' fk]; end
 end
+
