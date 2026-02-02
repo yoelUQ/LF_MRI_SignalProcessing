@@ -1,0 +1,15 @@
+# MATLAB autosave & backups
+*.asv
+*.m~
+
+# Compiled / generated files
+*.mex*
+slprj/
+codegen/
+
+# Outputs (do not version)
+results/
+figures/
+
+# Data (usually large / reproducible)
+*.mat
